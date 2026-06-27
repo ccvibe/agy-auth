@@ -37,7 +37,7 @@ enum Commands {
     #[command(alias = "use")]
     Switch {
         /// The account ID or Email to switch to
-        account: String,
+        account: Option<String>,
     },
 
     /// Show the currently active account details
@@ -82,7 +82,7 @@ async fn main() -> anyhow::Result<()> {
             }
         }
         Commands::Switch { account } => {
-            if let Err(e) = switch_account(&account).await {
+            if let Err(e) = switch_account(account.as_deref()).await {
                 eprintln!("{} {}", "Error:".red(), e);
             }
         }
@@ -160,13 +160,11 @@ async fn add_account(refresh_token: Option<String>) -> anyhow::Result<()> {
     let email = user_info.email.clone();
     let display_name = user_info.get_display_name();
 
-    let account = storage::upsert_account(email.clone(), display_name, token_data)
+    storage::upsert_account(email.clone(), display_name, token_data)
         .map_err(|e| anyhow::anyhow!("Failed to register account: {}", e))?;
 
     println!("Successfully registered account: {}", email.bright_green());
-
-    // Switch to it immediately
-    switch_to_account_object(&account).await?;
+    println!("Use `agy-auth switch {}` to switch to this account.", email.cyan());
 
     Ok(())
 }
@@ -277,13 +275,56 @@ fn open_browser(url: &str) {
     let _ = Command::new("xdg-open").arg(url).spawn();
 }
 
-async fn switch_account(account_ref: &str) -> anyhow::Result<()> {
+async fn switch_account(account_ref: Option<&str>) -> anyhow::Result<()> {
     let accounts = storage::list_accounts().map_err(|e| anyhow::anyhow!(e))?;
-    let target = accounts.into_iter().find(|acc| {
-        acc.id == account_ref || acc.email.eq_ignore_ascii_case(account_ref)
-    }).ok_or_else(|| {
-        anyhow::anyhow!("Account not found matching: '{}'", account_ref)
-    })?;
+    if accounts.is_empty() {
+        return Err(anyhow::anyhow!(
+            "No registered accounts found. Please add an account using `agy-auth add` first."
+        ));
+    }
+
+    let target = match account_ref {
+        Some(r) => accounts
+            .into_iter()
+            .find(|acc| acc.id == r || acc.email.eq_ignore_ascii_case(r))
+            .ok_or_else(|| anyhow::anyhow!("Account not found matching: '{}'", r))?,
+        None => {
+            use dialoguer::{theme::ColorfulTheme, Select};
+
+            let current_id = storage::get_current_account_id();
+            let mut items = Vec::new();
+            let mut default_idx = 0;
+
+            for (idx, acc) in accounts.iter().enumerate() {
+                let mut label = acc.email.clone();
+                if let Some(ref name) = acc.name {
+                    if !name.is_empty() {
+                        label = format!("{} ({})", label, name);
+                    }
+                }
+                if Some(acc.id.clone()) == current_id {
+                    label = format!("{} [Active]", label);
+                    default_idx = idx;
+                }
+                items.push(label);
+            }
+
+            let selection = Select::with_theme(&ColorfulTheme::default())
+                .with_prompt("Select the account to switch to")
+                .default(default_idx)
+                .items(&items)
+                .interact_opt()
+                .map_err(|e| anyhow::anyhow!("Failed to read selection: {}", e))?;
+
+            match selection {
+                Some(idx) => accounts.into_iter().nth(idx).unwrap(),
+                None => {
+                    println!("Switch cancelled.");
+                    return Ok(());
+                }
+            }
+        }
+    };
 
     switch_to_account_object(&target).await
 }
