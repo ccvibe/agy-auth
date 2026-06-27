@@ -34,10 +34,12 @@ if ! cargo build; then
 fi
 echo -e "${GREEN}Cargo build succeeded!${NC}"
 
-# 4. Bump version in package.json
-echo -e "${BLUE}Bumping patch version in package.json...${NC}"
+# 4. Bump version in package.json and Cargo.toml
+echo -e "${BLUE}Bumping patch version in package.json and Cargo.toml...${NC}"
 NEW_VERSION=$(node -e "
   const fs = require('fs');
+  
+  // Update package.json
   const pkg = JSON.parse(fs.readFileSync('package.json', 'utf8'));
   const parts = pkg.version.split('.');
   parts[2] = String(Number(parts[2]) + 1);
@@ -49,23 +51,33 @@ NEW_VERSION=$(node -e "
     }
   }
   fs.writeFileSync('package.json', JSON.stringify(pkg, null, 2) + '\n', 'utf8');
+  
+  // Update Cargo.toml
+  let cargo = fs.readFileSync('Cargo.toml', 'utf8');
+  cargo = cargo.replace(/^version\s*=\s*\"[^\"]+\"/m, 'version = \"' + newV + '\"');
+  fs.writeFileSync('Cargo.toml', cargo, 'utf8');
+  
   console.log(newV);
 ")
 
 echo -e "${GREEN}Version bumped to v${NEW_VERSION}${NC}"
 
-# 5. Commit changes
+# 5. Update Cargo.lock to sync with new Cargo.toml version
+echo -e "${BLUE}Updating Cargo.lock...${NC}"
+cargo check
+
+# 6. Commit changes
 echo -e "${BLUE}Committing changes...${NC}"
 git add .
 git commit -m "chore: release v${NEW_VERSION}"
 echo -e "${GREEN}Committed successfully.${NC}"
 
-# 6. Create Tag
+# 7. Create Tag
 echo -e "${BLUE}Creating git tag v${NEW_VERSION}...${NC}"
 git tag "v${NEW_VERSION}"
 echo -e "${GREEN}Tag v${NEW_VERSION} created.${NC}"
 
-# 7. Push to remote
+# 8. Push to remote
 echo -e "${BLUE}Pushing code and tag to remote repository...${NC}"
 git push origin main
 git push origin "v${NEW_VERSION}"
