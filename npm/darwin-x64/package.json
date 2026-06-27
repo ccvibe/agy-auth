@@ -1,0 +1,8 @@
+{
+  "name": "@ccvibe/agy-auth-darwin-x64",
+  "version": "1.0.1",
+  "description": "Precompiled agy-auth binary for macOS x64",
+  "os": ["darwin"],
+  "cpu": ["x64"],
+  "files": ["agy-auth"]
+}

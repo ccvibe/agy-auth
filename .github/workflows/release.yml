@@ -1,0 +1,101 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build - ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            bin_path: target/x86_64-unknown-linux-gnu/release/agy-auth
+            asset_name: agy-auth-linux-x86_64
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            bin_path: target/x86_64-apple-darwin/release/agy-auth
+            asset_name: agy-auth-macos-x86_64
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            bin_path: target/aarch64-apple-darwin/release/agy-auth
+            asset_name: agy-auth-macos-aarch64
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            bin_path: target/x86_64-pc-windows-msvc/release/agy-auth.exe
+            asset_name: agy-auth-windows-x86_64.exe
+
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          target: ${{ matrix.target }}
+
+      - name: Build Release Binary
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Prepare Assets (Unix)
+        if: matrix.os != 'windows-latest'
+        run: |
+          mkdir -p dist
+          cp ${{ matrix.bin_path }} dist/${{ matrix.asset_name }}
+          cd dist
+          tar -czf ../${{ matrix.asset_name }}.tar.gz ${{ matrix.asset_name }}
+
+      - name: Prepare Assets (Windows)
+        if: matrix.os == 'windows-latest'
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp ${{ matrix.bin_path }} dist/${{ matrix.asset_name }}
+          cd dist
+          tar -czf ../${{ matrix.asset_name }}.tar.gz ${{ matrix.asset_name }}
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: bin-${{ matrix.target }}
+          path: ${{ matrix.asset_name }}.tar.gz
+
+  release:
+    name: Create GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v4
+
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Flatten Artifacts Structure
+        run: |
+          mkdir -p dist
+          find artifacts -name "*.tar.gz" -exec cp {} dist/ \;
+          ls -la dist/
+
+      - name: Generate Release Notes
+        id: release_notes
+        run: |
+          echo "Release created automatically by GitHub Actions workflow." > release_notes.md
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.tar.gz
+          body_path: release_notes.md
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

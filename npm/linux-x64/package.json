@@ -1,0 +1,8 @@
+{
+  "name": "@ccvibe/agy-auth-linux-x64",
+  "version": "1.0.1",
+  "description": "Precompiled agy-auth binary for Linux x64",
+  "os": ["linux"],
+  "cpu": ["x64"],
+  "files": ["agy-auth"]
+}

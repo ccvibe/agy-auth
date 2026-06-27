@@ -1,0 +1,59 @@
+#!/usr/bin/env node
+
+const { spawn } = require('child_process');
+const path = require('path');
+const fs = require('fs');
+
+const platform = process.platform;
+const arch = process.arch;
+
+let packageName;
+let binaryName = 'agy-auth';
+
+if (platform === 'darwin' && arch === 'x64') {
+    packageName = '@ccvibe/agy-auth-darwin-x64';
+} else if (platform === 'darwin' && arch === 'arm64') {
+    packageName = '@ccvibe/agy-auth-darwin-arm64';
+} else if (platform === 'linux' && arch === 'x64') {
+    packageName = '@ccvibe/agy-auth-linux-x64';
+} else if (platform === 'win32' && arch === 'x64') {
+    packageName = '@ccvibe/agy-auth-win32-x64';
+    binaryName = 'agy-auth.exe';
+} else {
+    console.error(`Error: Unsupported platform/architecture: ${platform}/${arch}`);
+    process.exit(1);
+}
+
+// Scoped packages are stored under @scope/pkg-name in node_modules
+const candidatePaths = [
+    // 1. Flat node_modules (production)
+    path.join(__dirname, '..', '..', '..', packageName, binaryName),
+    // 2. Nested node_modules (production)
+    path.join(__dirname, '..', '..', 'node_modules', packageName, binaryName),
+    // 3. Local build path (development)
+    path.join(__dirname, '..', '..', 'target', 'release', binaryName),
+    path.join(__dirname, '..', '..', 'target', 'debug', binaryName),
+];
+
+let resolvedPath = null;
+for (const p of candidatePaths) {
+    if (fs.existsSync(p)) {
+        resolvedPath = p;
+        break;
+    }
+}
+
+if (!resolvedPath) {
+    console.error(`Error: Could not locate the agy-auth binary for ${platform}/${arch}.`);
+    console.error(`Looked in:`);
+    candidatePaths.forEach(p => console.error(`  - ${p}`));
+    console.error(`\nTry reinstalling: npm install -g agy-auth`);
+    process.exit(1);
+}
+
+const args = process.argv.slice(2);
+const child = spawn(resolvedPath, args, { stdio: 'inherit' });
+
+child.on('close', (code) => {
+    process.exit(code);
+});
