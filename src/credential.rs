@@ -14,6 +14,234 @@ struct AntigravityCredentialPayload {
     auth_method: String,
 }
 
+#[derive(Debug, serde::Deserialize)]
+struct StoredAntigravityCredentialToken {
+    access_token: Option<String>,
+    refresh_token: Option<String>,
+    token_type: Option<String>,
+    expiry: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct StoredAntigravityCredentialPayload {
+    token: StoredAntigravityCredentialToken,
+    auth_method: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub struct AntigravitySystemCredential {
+    pub access_token: Option<String>,
+    pub refresh_token: String,
+    pub token_type: Option<String>,
+    pub expiry: Option<String>,
+    pub auth_method: Option<String>,
+}
+
+fn normalize_non_empty(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn normalize_antigravity_credential_secret(secret: &str) -> Result<String, String> {
+    let trimmed = secret.trim();
+    if trimmed.is_empty() {
+        return Err("Antigravity system credential is empty".to_string());
+    }
+
+    // Go keyring on macOS stores: go-keyring-base64:<base64(json)>
+    if let Some(encoded) = trimmed.strip_prefix("go-keyring-base64:") {
+        use base64::{engine::general_purpose::STANDARD, Engine as _};
+        let decoded = STANDARD
+            .decode(encoded.trim())
+            .map_err(|e| format!("Failed to decode go-keyring payload: {}", e))?;
+        return String::from_utf8(decoded)
+            .map_err(|e| format!("Invalid UTF-8 in go-keyring payload: {}", e));
+    }
+
+    Ok(trimmed.to_string())
+}
+
+fn parse_antigravity_system_credential(secret: &str) -> Result<AntigravitySystemCredential, String> {
+    let payload_json = normalize_antigravity_credential_secret(secret)?;
+    let payload: StoredAntigravityCredentialPayload = serde_json::from_str(&payload_json)
+        .map_err(|e| format!("Failed to parse Antigravity system credential: {}", e))?;
+    let refresh_token = normalize_non_empty(payload.token.refresh_token.as_deref())
+        .ok_or_else(|| "Antigravity system credential missing refresh_token".to_string())?;
+
+    Ok(AntigravitySystemCredential {
+        access_token: normalize_non_empty(payload.token.access_token.as_deref()),
+        refresh_token,
+        token_type: normalize_non_empty(payload.token.token_type.as_deref()),
+        expiry: normalize_non_empty(payload.token.expiry.as_deref()),
+        auth_method: normalize_non_empty(payload.auth_method.as_deref()),
+    })
+}
+
+/// Read the currently active Antigravity credential from OS secret storage.
+pub fn read_antigravity_system_credential() -> Result<Option<AntigravitySystemCredential>, String> {
+    let secret = read_antigravity_system_credential_secret()?;
+    match secret {
+        Some(secret) => parse_antigravity_system_credential(&secret).map(Some),
+        None => Ok(None),
+    }
+}
+
+fn read_antigravity_system_credential_secret() -> Result<Option<String>, String> {
+    #[cfg(target_os = "macos")]
+    {
+        use std::process::Command;
+
+        let output = Command::new("security")
+            .args([
+                "find-generic-password",
+                "-s",
+                "gemini",
+                "-a",
+                "antigravity",
+                "-w",
+            ])
+            .output()
+            .map_err(|e| format!("Failed to run security command: {}", e))?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            // Item not found
+            if stderr.contains("could not be found") || stderr.contains("SecKeychainSearchCopyNext") {
+                return Ok(None);
+            }
+            return Err(format!("Keychain read failed: {}", stderr.trim()));
+        }
+
+        let secret = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if secret.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(secret))
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        use std::ffi::OsStr;
+        use std::os::windows::ffi::OsStrExt;
+        use std::ptr;
+
+        #[repr(C)]
+        struct FileTime {
+            dw_low_date_time: u32,
+            dw_high_date_time: u32,
+        }
+
+        #[repr(C)]
+        struct CredentialW {
+            flags: u32,
+            cred_type: u32,
+            target_name: *const u16,
+            comment: *const u16,
+            last_written: FileTime,
+            credential_blob_size: u32,
+            credential_blob: *const u8,
+            persist: u32,
+            attribute_count: u32,
+            attributes: *const std::ffi::c_void,
+            target_alias: *const u16,
+            user_name: *const u16,
+        }
+
+        #[link(name = "advapi32")]
+        extern "system" {
+            fn CredReadW(
+                target_name: *const u16,
+                type_: u32,
+                flags: u32,
+                credential: *mut *mut CredentialW,
+            ) -> i32;
+            fn CredFree(buffer: *mut std::ffi::c_void);
+        }
+
+        const CRED_TYPE_GENERIC: u32 = 1;
+        const ERROR_NOT_FOUND: i32 = 1168;
+
+        let target_wide: Vec<u16> = OsStr::new("gemini:antigravity")
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        let mut credential_ptr: *mut CredentialW = ptr::null_mut();
+
+        unsafe {
+            if CredReadW(
+                target_wide.as_ptr(),
+                CRED_TYPE_GENERIC,
+                0,
+                &mut credential_ptr,
+            ) == 0
+            {
+                let error = std::io::Error::last_os_error();
+                if error.raw_os_error() == Some(ERROR_NOT_FOUND) {
+                    return Ok(None);
+                }
+                return Err(format!(
+                    "Failed to read Windows Credential Manager: {}",
+                    error
+                ));
+            }
+
+            if credential_ptr.is_null() {
+                return Ok(None);
+            }
+
+            let credential = &*credential_ptr;
+            let secret = if credential.credential_blob.is_null() || credential.credential_blob_size == 0
+            {
+                String::new()
+            } else {
+                let bytes = std::slice::from_raw_parts(
+                    credential.credential_blob,
+                    credential.credential_blob_size as usize,
+                );
+                String::from_utf8_lossy(bytes).trim().to_string()
+            };
+            CredFree(credential_ptr.cast());
+
+            if secret.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(secret))
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        use std::process::Command;
+
+        let output = Command::new("secret-tool")
+            .args(["lookup", "service", "gemini", "username", "antigravity"])
+            .output()
+            .map_err(|e| format!("Failed to run secret-tool: {}", e))?;
+
+        if !output.status.success() {
+            // Not found is common when nothing is stored
+            return Ok(None);
+        }
+
+        let secret = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if secret.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(secret))
+        }
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
+    {
+        Ok(None)
+    }
+}
+
 fn build_antigravity_credential_payload(account: &Account) -> Result<String, String> {
     let expiry = chrono::DateTime::from_timestamp(account.token.expiry_timestamp, 0)
         .unwrap_or_else(chrono::Utc::now)

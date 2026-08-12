@@ -198,3 +198,171 @@ fn unified_topic_entry_key(data: &[u8]) -> Option<&str> {
 
     None
 }
+
+/// Extract refresh_token from `antigravityUnifiedStateSync.oauthToken` blob.
+/// Primary path: Topic.data[oauthTokenInfoSentinelKey].Row.value = base64(OAuthTokenInfo), field 3.
+/// Fallback: walk length-delimited fields looking for a Google refresh token (`1//...`).
+pub fn extract_refresh_token_from_unified_oauth_token(data: &[u8]) -> Option<String> {
+    if let Some(token) = extract_refresh_token_via_sentinel(data) {
+        return Some(token);
+    }
+    scan_refresh_token_strings(data)
+}
+
+fn extract_refresh_token_via_sentinel(data: &[u8]) -> Option<String> {
+    let mut offset = 0;
+    while offset < data.len() {
+        let (tag, new_offset) = read_varint(data, offset).ok()?;
+        let wire_type = (tag & 7) as u8;
+        let field_num = (tag >> 3) as u32;
+
+        if field_num == 1 && wire_type == 2 {
+            let (length, content_offset) = read_varint(data, new_offset).ok()?;
+            let length = length as usize;
+            if content_offset + length > data.len() {
+                return None;
+            }
+            let entry = &data[content_offset..content_offset + length];
+            if let Some(refresh_token) = extract_refresh_token_from_unified_entry(entry) {
+                return Some(refresh_token);
+            }
+        }
+
+        offset = skip_field(data, new_offset, wire_type).ok()?;
+    }
+
+    None
+}
+
+fn extract_refresh_token_from_unified_entry(data: &[u8]) -> Option<String> {
+    let mut offset = 0;
+    let mut sentinel_matched = false;
+    let mut row_data: Option<Vec<u8>> = None;
+
+    while offset < data.len() {
+        let (tag, new_offset) = read_varint(data, offset).ok()?;
+        let wire_type = (tag & 7) as u8;
+        let field_num = (tag >> 3) as u32;
+
+        if wire_type == 2 {
+            let (length, content_offset) = read_varint(data, new_offset).ok()?;
+            let length = length as usize;
+            if content_offset + length > data.len() {
+                return None;
+            }
+            let value = &data[content_offset..content_offset + length];
+            if field_num == 1 {
+                if let Ok(key) = std::str::from_utf8(value) {
+                    // Official sentinel written by agy-auth / cockpit inject path.
+                    // Also accept native IDE variants that embed OAuthTokenInfo the same way.
+                    sentinel_matched = key == "oauthTokenInfoSentinelKey"
+                        || key.contains("oauthToken")
+                        || key.contains("authState");
+                }
+            } else if field_num == 2 {
+                row_data = Some(value.to_vec());
+            }
+        }
+
+        offset = skip_field(data, new_offset, wire_type).ok()?;
+    }
+
+    if !sentinel_matched {
+        return None;
+    }
+
+    let row_data = row_data?;
+    let oauth_info_b64 = extract_string_field(&row_data, 1)?;
+    let oauth_info = general_purpose::STANDARD.decode(oauth_info_b64).ok()?;
+    extract_string_field(&oauth_info, 3).filter(|s| looks_like_refresh_token(s))
+}
+
+fn extract_string_field(data: &[u8], target_field: u32) -> Option<String> {
+    let mut offset = 0;
+    while offset < data.len() {
+        let (tag, new_offset) = read_varint(data, offset).ok()?;
+        let wire_type = (tag & 7) as u8;
+        let field_num = (tag >> 3) as u32;
+
+        if field_num == target_field && wire_type == 2 {
+            let (length, content_offset) = read_varint(data, new_offset).ok()?;
+            let length = length as usize;
+            if content_offset + length > data.len() {
+                return None;
+            }
+            let value = &data[content_offset..content_offset + length];
+            return String::from_utf8(value.to_vec()).ok();
+        }
+
+        offset = skip_field(data, new_offset, wire_type).ok()?;
+    }
+
+    None
+}
+
+fn looks_like_refresh_token(value: &str) -> bool {
+    let trimmed = value.trim();
+    trimmed.starts_with("1//") && trimmed.len() >= 20
+}
+
+fn scan_refresh_token_strings(data: &[u8]) -> Option<String> {
+    fn walk(data: &[u8], depth: usize) -> Option<String> {
+        if depth > 8 {
+            return None;
+        }
+        let mut offset = 0;
+        while offset < data.len() {
+            let (tag, new_offset) = match read_varint(data, offset) {
+                Ok(v) => v,
+                Err(_) => break,
+            };
+            let wire_type = (tag & 7) as u8;
+            let field_num = (tag >> 3) as u32;
+
+            if wire_type == 2 {
+                let (length, content_offset) = match read_varint(data, new_offset) {
+                    Ok(v) => v,
+                    Err(_) => break,
+                };
+                let length = length as usize;
+                if content_offset + length > data.len() {
+                    break;
+                }
+                let value = &data[content_offset..content_offset + length];
+
+                if let Ok(s) = std::str::from_utf8(value) {
+                    if looks_like_refresh_token(s) {
+                        return Some(s.trim().to_string());
+                    }
+                    // Nested base64(OAuthTokenInfo) commonly appears as field 1 of Row.
+                    if field_num == 1 && s.len() > 40 {
+                        if let Ok(decoded) = general_purpose::STANDARD.decode(s.trim()) {
+                            if let Some(token) = walk(&decoded, depth + 1) {
+                                return Some(token);
+                            }
+                            if let Some(token) = extract_string_field(&decoded, 3)
+                                .filter(|t| looks_like_refresh_token(&t))
+                            {
+                                return Some(token);
+                            }
+                        }
+                    }
+                }
+
+                if let Some(token) = walk(value, depth + 1) {
+                    return Some(token);
+                }
+
+                offset = content_offset + length;
+            } else {
+                offset = match skip_field(data, new_offset, wire_type) {
+                    Ok(v) => v,
+                    Err(_) => break,
+                };
+            }
+        }
+        None
+    }
+
+    walk(data, 0)
+}

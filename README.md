@@ -52,3 +52,29 @@ npx agy-auth list
   agy-auth delete <account_email_or_id> # 或者 agy-auth remove <email_or_id>
   ```
 
+* **导入账号**：
+  ```bash
+  # 交互选择：本机 Antigravity 或 JSON 文件
+  agy-auth import
+
+  # 从本机当前 Antigravity / AGY 登录态导入
+  # （按顺序尝试：系统钥匙串 → CLI token 文件 → IDE state.vscdb）
+  agy-auth import --local
+
+  # 从 JSON 文件导入（支持 cockpit / agy-auth 导出格式）
+  agy-auth import ./accounts.json
+  ```
+
+  JSON 示例（简化格式，可单对象或数组）：
+
+  ```json
+  [
+    {
+      "email": "user@gmail.com",
+      "refresh_token": "1//0e...",
+      "tags": ["work"],
+      "notes": "optional"
+    }
+  ]
+  ```
+

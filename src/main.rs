@@ -4,10 +4,12 @@ mod credential;
 mod storage;
 mod ide_db;
 mod protobuf;
+mod import;
 
 use clap::{Parser, Subcommand};
 use models::{Account, TokenData};
 use colored::*;
+use std::path::PathBuf;
 use std::process::Command;
 use tabled::{Table, Tabled};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -31,6 +33,16 @@ enum Commands {
     Add {
         /// Optional: Google OAuth refresh token. If not provided, starts interactive browser login.
         refresh_token: Option<String>,
+    },
+
+    /// Import accounts from local Antigravity credentials or a JSON file
+    Import {
+        /// Path to a JSON file to import (cockpit/agy-auth export formats supported)
+        path: Option<PathBuf>,
+
+        /// Import the currently logged-in Antigravity / AGY account from this machine
+        #[arg(long, short = 'l', conflicts_with = "path")]
+        local: bool,
     },
 
     /// Switch active account
@@ -81,6 +93,11 @@ async fn main() -> anyhow::Result<()> {
                 eprintln!("{} {}", "Error:".red(), e);
             }
         }
+        Commands::Import { path, local } => {
+            if let Err(e) = import_accounts(path, local).await {
+                eprintln!("{} {}", "Error:".red(), e);
+            }
+        }
         Commands::Switch { account } => {
             if let Err(e) = switch_account(account.as_deref()).await {
                 eprintln!("{} {}", "Error:".red(), e);
@@ -94,6 +111,107 @@ async fn main() -> anyhow::Result<()> {
         Commands::Delete { account } => {
             if let Err(e) = delete_account(&account).await {
                 eprintln!("{} {}", "Error:".red(), e);
+            }
+        }
+    }
+
+    Ok(())
+}
+
+async fn import_accounts(path: Option<PathBuf>, local: bool) -> anyhow::Result<()> {
+    enum ImportMode {
+        Local,
+        Json(PathBuf),
+    }
+
+    let mode = if local {
+        ImportMode::Local
+    } else if let Some(path) = path {
+        ImportMode::Json(path)
+    } else {
+        use dialoguer::{theme::ColorfulTheme, Select};
+
+        let items = [
+            "Local Antigravity / AGY account (system keychain, CLI token, or IDE DB)",
+            "JSON file",
+        ];
+        let selection = Select::with_theme(&ColorfulTheme::default())
+            .with_prompt("Select import source")
+            .default(0)
+            .items(&items)
+            .interact_opt()
+            .map_err(|e| anyhow::anyhow!("Failed to read selection: {}", e))?;
+
+        match selection {
+            Some(0) => ImportMode::Local,
+            Some(1) => {
+                let path: String = dialoguer::Input::with_theme(&ColorfulTheme::default())
+                    .with_prompt("Path to JSON file")
+                    .interact_text()
+                    .map_err(|e| anyhow::anyhow!("Failed to read path: {}", e))?;
+                ImportMode::Json(PathBuf::from(path.trim()))
+            }
+            _ => {
+                println!("Import cancelled.");
+                return Ok(());
+            }
+        }
+    };
+
+    match mode {
+        ImportMode::Local => {
+            println!("Importing local Antigravity account...");
+            let account = import::import_from_local()
+                .await
+                .map_err(|e| anyhow::anyhow!(e))?;
+            println!(
+                "{} Imported account: {}",
+                "Success:".green().bold(),
+                account.email.bright_green()
+            );
+            println!(
+                "Use `agy-auth switch {}` to make it active.",
+                account.email.cyan()
+            );
+        }
+        ImportMode::Json(path) => {
+            if !path.exists() {
+                return Err(anyhow::anyhow!("JSON file not found: {}", path.display()));
+            }
+            println!("Importing from JSON: {}", path.display());
+            let summary = import::import_from_json_file(&path)
+                .await
+                .map_err(|e| anyhow::anyhow!(e))?;
+
+            if summary.imported.is_empty() && summary.failed.is_empty() {
+                println!("No accounts imported.");
+            } else {
+                println!(
+                    "{} Imported {} account(s).",
+                    "Success:".green().bold(),
+                    summary.imported.len()
+                );
+                for acc in &summary.imported {
+                    println!("  + {}", acc.email.bright_green());
+                }
+            }
+
+            if !summary.failed.is_empty() {
+                println!(
+                    "{} {} account(s) failed:",
+                    "Warning:".yellow().bold(),
+                    summary.failed.len()
+                );
+                for (label, err) in &summary.failed {
+                    println!("  - {}: {}", label, err);
+                }
+            }
+
+            if let Some(first) = summary.imported.first() {
+                println!(
+                    "Use `agy-auth switch {}` to make an account active.",
+                    first.email.cyan()
+                );
             }
         }
     }
